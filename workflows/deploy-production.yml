@@ -1,0 +1,626 @@
+# Sanitized copy of a production workflow from Quot3D (get-quot3d.com).
+# Hostnames, users and private repo names are replaced with GitHub `vars`;
+# the generated .env block is trimmed. Logic is otherwise unchanged.
+# Stored under workflows/ (not .github/workflows/) so it never runs here.
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_backend:
+        description: 'Force backend deployment'
+        type: boolean
+        default: false
+      force_frontend:
+        description: 'Force frontend deployment'
+        type: boolean
+        default: false
+      skip_slice_gate:
+        description: 'EMERGENCY ONLY - skip the pre-reload slice gate (ships without proving quotes can be sliced; use only when the slicer itself is broken and an unrelated fix must go out)'
+        type: boolean
+        default: false
+
+# Deploys mutate one directory on one VPS, so they must never run in parallel.
+# Two PRs merged ~10s apart once put two `npm ci` runs in the same node_modules;
+# the second failed with ENOTEMPTY, the build never ran, and the deploy reloaded
+# PM2 against a broken install - taking production down with 502s.
+# cancel-in-progress stays false: cancelling mid-deploy would leave the server
+# in a half-updated state, which is worse than queueing.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+  HETZNER_HOST: ${{ vars.DEPLOY_HOST }}
+  HETZNER_USER: ${{ vars.DEPLOY_USER }}
+  APP_DIR: /var/www/quot3d-api
+
+jobs:
+  # ============================================
+  # Stage 0: Detect Changes
+  # ============================================
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.changes.outputs.backend }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      workflows: ${{ steps.changes.outputs.workflows }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to compare with origin
+
+      - name: Check for changes
+        id: changes
+        run: |
+          # Use GitHub's before/after SHAs for accurate change detection
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+
+          echo "Comparing: $BEFORE_SHA -> $AFTER_SHA"
+
+          # Handle first commit or force push (before SHA is all zeros)
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push to branch, deploying everything"
+            CHANGED_FILES="backend/ frontend/"
+          else
+            CHANGED_FILES=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" 2>/dev/null || echo "backend/ frontend/")
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Check for backend changes
+          if echo "$CHANGED_FILES" | grep -qE '^backend/'; then
+            echo "backend=true" >> $GITHUB_OUTPUT
+            echo "✓ Backend changes detected"
+          else
+            echo "backend=false" >> $GITHUB_OUTPUT
+            echo "○ No backend changes"
+          fi
+
+          # Check for frontend changes
+          if echo "$CHANGED_FILES" | grep -qE '^frontend/'; then
+            echo "frontend=true" >> $GITHUB_OUTPUT
+            echo "✓ Frontend changes detected"
+          else
+            echo "frontend=false" >> $GITHUB_OUTPUT
+            echo "○ No frontend changes"
+          fi
+
+          # Check for workflow changes (always run full pipeline)
+          if echo "$CHANGED_FILES" | grep -qE '^\.github/workflows/'; then
+            echo "workflows=true" >> $GITHUB_OUTPUT
+            echo "✓ Workflow changes detected - running full pipeline"
+          else
+            echo "workflows=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply manual overrides
+        id: overrides
+        run: |
+          # Check for manual workflow dispatch overrides
+          if [ "${{ github.event.inputs.force_backend }}" == "true" ]; then
+            echo "backend=true" >> $GITHUB_OUTPUT
+            echo "✓ Backend deployment forced via workflow dispatch"
+          fi
+          if [ "${{ github.event.inputs.force_frontend }}" == "true" ]; then
+            echo "frontend=true" >> $GITHUB_OUTPUT
+            echo "✓ Frontend deployment forced via workflow dispatch"
+          fi
+
+      - name: Summary
+        run: |
+          echo "============================================"
+          echo "Change Detection Summary"
+          echo "============================================"
+          echo "Backend changes:  ${{ steps.changes.outputs.backend }}"
+          echo "Frontend changes: ${{ steps.changes.outputs.frontend }}"
+          echo "Workflow changes: ${{ steps.changes.outputs.workflows }}"
+          echo "============================================"
+
+  # ============================================
+  # Stage 1: Frontend Type Check (only if frontend changed)
+  # Unit tests already ran in the PR workflow (ci-main.yml)
+  # ============================================
+  frontend-check:
+    name: Frontend Type Check
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.workflows == 'true' || github.event.inputs.force_frontend == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm run test:unit
+
+      - name: Test build
+        working-directory: frontend
+        run: npm run build:app
+        env:
+          VITE_API_URL: https://api.get-quot3d.com
+          VITE_SUPABASE_URL: https://placeholder.supabase.co
+          VITE_SUPABASE_ANON_KEY: placeholder
+
+  # ============================================
+  # Stage 2: Deploy Backend to Hetzner
+  # ============================================
+  deploy-backend:
+    name: Deploy Backend to Hetzner
+    needs: [detect-changes, frontend-check]
+    if: |
+      !cancelled() &&
+      (needs.frontend-check.result == 'success' || needs.frontend-check.result == 'skipped') &&
+      (needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.workflows == 'true' || github.event.inputs.force_backend == 'true')
+    runs-on: ubuntu-latest
+    environment: "quot3d (Production)"
+    outputs:
+      deployed: ${{ steps.deploy.outcome == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ env.HETZNER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          echo "✓ SSH key configured"
+
+      - name: Create .env file from secrets
+        run: |
+          echo "📝 Creating .env file on server from GitHub secrets..."
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ env.HETZNER_USER }}@${{ env.HETZNER_HOST }} << EOF
+            cat > ${{ env.APP_DIR }}/.env << 'ENVEOF'
+          # ===========================================
+          # PRODUCTION ENVIRONMENT VARIABLES
+          # Generated by CI/CD from GitHub Secrets on every deploy.
+          # (Trimmed for this public copy - the real file also wires up
+          #  payments, email, object storage, monitoring and alerting.)
+          # ===========================================
+          DATABASE_URL="${{ secrets.DATABASE_URL }}"
+          DIRECT_DATABASE_URL="${{ secrets.DIRECT_DATABASE_URL }}"
+          NODE_ENV=production
+          PORT=3000
+          SESSION_SECRET=${{ secrets.SESSION_SECRET }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          SLICER_ENABLED=true
+          SLICER_TIMEOUT_MS=600000
+          SLIC3D_PATH=/usr/local/bin/slic3d
+          SENTRY_DSN=${{ secrets.SENTRY_DSN }}
+          ENVEOF
+            chmod 600 ${{ env.APP_DIR }}/.env
+            echo "✓ .env file created"
+          EOF
+
+      - name: Warn that the slice gate is being skipped
+        if: github.event.inputs.skip_slice_gate == 'true'
+        run: |
+          MSG="The slice gate is SKIPPED for this deploy (workflow_dispatch skip_slice_gate=true, triggered by ${{ github.actor }}). Nothing will prove quotes can be sliced before the new code serves traffic - test a real quote by hand immediately after deploy."
+          echo "::warning title=Slice gate skipped::$MSG"
+          {
+            echo "## ⚠️ Slice gate skipped"
+            echo ""
+            echo "$MSG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy to Hetzner
+        id: deploy
+        run: |
+          echo "🚀 Deploying backend to Hetzner..."
+
+          # Sync backend code (excluding node_modules and uploads)
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
+            --exclude 'node_modules' \
+            --exclude 'uploads' \
+            --exclude '.env' \
+            --exclude 'dist' \
+            backend/ ${{ env.HETZNER_USER }}@${{ env.HETZNER_HOST }}:${{ env.APP_DIR }}/
+
+          # Install dependencies and build on server
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${{ env.HETZNER_USER }}@${{ env.HETZNER_HOST }} << 'EOF'
+            # Abort on the first failing command. Without this the script ran
+            # straight through a failed `npm ci` and reloaded PM2 against a
+            # broken node_modules and a build that never happened - PM2 reported
+            # success, the workers crash-looped, and nginx served 502s. A failed
+            # build must leave the previous working version running instead.
+            # (-u is deliberately omitted: the script sources .env, and an unset
+            # variable there would abort an otherwise healthy deploy.)
+            set -eo pipefail
+
+            cd /var/www/quot3d-api
+
+            # Install dependencies.
+            # A previous concurrent deploy can leave node_modules half-removed,
+            # which makes npm ci fail with ENOTEMPTY. Clear it and retry once so
+            # a single bad run doesn't need manual repair on the box.
+            if ! npm ci --production=false; then
+              echo "npm ci failed - clearing node_modules and retrying once"
+              rm -rf node_modules
+              npm ci --production=false
+            fi
+
+            # Generate Prisma client
+            npx prisma generate
+
+            # Build TypeScript
+            npm run build
+
+            # ---- Slice gate -------------------------------------------------
+            # Slice a real part (3DBenchy) with the real slic3d binary, through
+            # the code that is about to ship, for two fixture shops - before it
+            # serves traffic. /health only checks that the binary runs, so broken
+            # slicer presets would otherwise deploy green and fail every quote at
+            # request time. See backend/src/smoke/slice-smoke-test.ts.
+            #
+            # A failure exits this script here: before migrations and before
+            # pm2 reload, so the running workers keep serving the previous code.
+            # The gate never touches the database or uploads.
+            #   timeout: kills the whole process group (node AND slic3d) on a hang
+            #   nice:    keeps the slicer from starving the live workers
+            #   </dev/null: this script arrives on stdin; nothing may read it
+            SKIP_SLICE_GATE="${{ github.event.inputs.skip_slice_gate == 'true' }}"
+            if [ "$SKIP_SLICE_GATE" = "true" ]; then
+              echo "::warning title=Slice gate skipped::Reloading WITHOUT slicing a test part - quotes are unverified"
+              echo "#################################################################"
+              echo "###  SLICE GATE SKIPPED (workflow_dispatch skip_slice_gate)    ###"
+              echo "###  Nothing proved quotes can be sliced before this reload.   ###"
+              echo "###  Run a real quote by hand as soon as the deploy finishes.  ###"
+              echo "#################################################################"
+            else
+              echo "Running slice gate (timeout 300s)..."
+              GATE_STATUS=0
+              timeout --kill-after=15s 300s nice -n 10 node dist/smoke/slice-smoke-test.js < /dev/null || GATE_STATUS=$?
+              if [ "$GATE_STATUS" -ne 0 ]; then
+                if [ "$GATE_STATUS" -eq 124 ] || [ "$GATE_STATUS" -eq 137 ]; then
+                  echo "::error title=Slice gate timed out::The slicer did not finish within 300s (exit $GATE_STATUS)"
+                else
+                  echo "::error title=Slice gate failed::Exit $GATE_STATUS - see the [slice-gate] lines above"
+                fi
+                echo "Slice gate FAILED - aborting before migrations and pm2 reload; the previous version keeps serving."
+                exit 1
+              fi
+              echo "✓ Slice gate passed"
+            fi
+
+            # Run database migrations using direct connection (not pooler)
+            # Source .env to get DIRECT_DATABASE_URL, then use it for migrations.
+            # (After the slice gate, so a refused deploy leaves the schema alone.)
+            set -a
+            source .env
+            set +a
+            DATABASE_URL="$DIRECT_DATABASE_URL" npx prisma migrate deploy
+
+            # Restart PM2 application with cluster mode (4 workers)
+            # Use reload for zero-downtime if already running, otherwise start fresh with cluster
+            if pm2 describe quot3d-api > /dev/null 2>&1; then
+              pm2 reload quot3d-api
+            else
+              pm2 start dist/index.js --name quot3d-api -i 4
+            fi
+
+            # Save PM2 process list
+            pm2 save
+          EOF
+
+          echo "✓ Backend deployed successfully"
+
+  # ============================================
+  # Stage 3: Health Check Backend
+  # ============================================
+  health-check-backend:
+    name: Health Check Backend
+    needs: [detect-changes, deploy-backend]
+    if: |
+      always() &&
+      needs.deploy-backend.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for server to be ready
+        run: |
+          echo "🔍 Waiting for backend to be healthy..."
+          for i in {1..30}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ env.HETZNER_HOST }}:3000/health" || echo "000")
+            if [ "$RESPONSE" = "200" ]; then
+              echo "✓ Backend is healthy with slicer (HTTP $RESPONSE)"
+              exit 0
+            elif [ "$RESPONSE" = "503" ]; then
+              # Backend is up but slicer is unavailable - this is a partial success
+              echo "⚠️ Backend is up but slicer unavailable (HTTP $RESPONSE)"
+              curl -s "http://${{ env.HETZNER_HOST }}:3000/health" | jq . || true
+              exit 0  # Allow deployment to continue - backend works, just no slicer
+            fi
+            echo "Attempt $i/30: HTTP $RESPONSE, waiting 10s..."
+            sleep 10
+          done
+          echo "✗ Backend health check failed after 5 minutes"
+          exit 1
+
+      - name: Test API endpoints
+        run: |
+          echo "Testing API endpoints..."
+
+          # Test health endpoint - show full response for debugging
+          echo "Health check response:"
+          curl -s "http://${{ env.HETZNER_HOST }}:3000/health" | jq . || curl -s "http://${{ env.HETZNER_HOST }}:3000/health"
+          echo "✓ /health OK"
+
+          # Test config endpoint
+          RESPONSE=$(curl -s "http://${{ env.HETZNER_HOST }}:3000/api/config")
+          if echo "$RESPONSE" | jq -e '.materials' > /dev/null 2>&1; then
+            echo "✓ /api/config OK"
+          else
+            echo "✗ /api/config failed"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+  # ============================================
+  # Stage 4: Integration Tests
+  # ============================================
+  integration-tests:
+    name: Integration Tests
+    needs: [detect-changes, health-check-backend]
+    if: |
+      always() &&
+      needs.health-check-backend.result == 'success'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quot3d_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: backend
+        run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+
+      - name: Run Prisma migrations
+        working-directory: backend
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+
+      - name: Run integration tests
+        working-directory: backend
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          NODE_ENV: test
+          API_BASE_URL: http://${{ env.HETZNER_HOST }}:3000
+
+  # ============================================
+  # Stage 5a: Playwright E2E Smoke Tests (gate before frontend deploy)
+  # Runs against production backend + a preview build of the frontend
+  # ============================================
+  playwright-e2e:
+    name: Playwright E2E Smoke Tests
+    needs: [detect-changes, frontend-check, health-check-backend]
+    if: |
+      !cancelled() &&
+      needs.health-check-backend.result == 'success' &&
+      (needs.frontend-check.result == 'success' || needs.frontend-check.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Pull Playwright Linux test image
+        run: docker pull mcr.microsoft.com/playwright:v1.59.0-noble
+
+      - name: Run Playwright E2E smoke tests
+        working-directory: frontend
+        run: npm run test:e2e:smoke -- --reporter=github,html
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:4173
+          CI: true
+          PLAYWRIGHT_HTML_OUTPUT_DIR: playwright-report-production-smoke
+          PLAYWRIGHT_HTML_OPEN: never
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+
+      - name: Upload Playwright smoke report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-production-smoke
+          path: frontend/playwright-report-production-smoke/
+          retention-days: 14
+
+  # ============================================
+  # Stage 5: Deploy Frontend
+  # ============================================
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: [detect-changes, frontend-check, integration-tests, health-check-backend, playwright-e2e]
+    if: |
+      !cancelled() &&
+      (
+        needs.detect-changes.outputs.frontend == 'true' ||
+        needs.detect-changes.outputs.workflows == 'true' ||
+        github.event.inputs.force_frontend == 'true' ||
+        needs.health-check-backend.result == 'success'
+      ) &&
+      (needs.frontend-check.result == 'success' || needs.frontend-check.result == 'skipped') &&
+      (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') &&
+      (needs.playwright-e2e.result == 'success' || needs.playwright-e2e.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend (SPA)
+        working-directory: frontend
+        run: npm run build:app
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+          VITE_SENTRY_RELEASE: quot3d-frontend@1.0.0
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: quot3d
+          directory: frontend/dist
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+
+  # ============================================
+  # Stage 6: Final Verification
+  # ============================================
+  verify-production:
+    name: Verify Production
+    needs: [detect-changes, deploy-frontend, deploy-backend, health-check-backend]
+    if: always() && (needs.deploy-frontend.result == 'success' || needs.deploy-backend.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify backend health
+        if: needs.deploy-backend.result == 'success'
+        run: |
+          echo "Verifying production backend..."
+          for i in {1..10}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ env.HETZNER_HOST }}:3000/health")
+            if [ "$RESPONSE" = "200" ]; then
+              echo "✓ Backend is healthy (HTTP $RESPONSE)"
+              break
+            fi
+            echo "Attempt $i/10: HTTP $RESPONSE, retrying..."
+            sleep 5
+          done
+
+      - name: Verify frontend
+        if: needs.deploy-frontend.result == 'success'
+        run: |
+          echo "Verifying frontend..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "https://quot3d.pages.dev")
+          echo "Frontend: HTTP $RESPONSE"
+
+      - name: Summary
+        run: |
+          echo "============================================"
+          echo "🎉 Deployment Complete!"
+          echo "============================================"
+          echo ""
+          echo "What was deployed:"
+          if [ "${{ needs.deploy-backend.result }}" == "success" ]; then
+            echo "  ✓ Backend:  http://${{ env.HETZNER_HOST }}:3000"
+          else
+            echo "  ○ Backend:  No changes"
+          fi
+          if [ "${{ needs.deploy-frontend.result }}" == "success" ]; then
+            echo "  ✓ Frontend: https://quot3d.pages.dev"
+          else
+            echo "  ○ Frontend: No changes"
+          fi
+          echo ""
+          echo "Commit: ${{ github.sha }}"
+          echo "============================================"
+
+  # ============================================
+  # No Changes - Skip
+  # ============================================
+  no-deploy:
+    name: No Deployment Needed
+    needs: [detect-changes]
+    if: |
+      needs.detect-changes.outputs.backend == 'false' &&
+      needs.detect-changes.outputs.frontend == 'false' &&
+      needs.detect-changes.outputs.workflows == 'false' &&
+      github.event.inputs.force_backend != 'true' &&
+      github.event.inputs.force_frontend != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip deployment
+        run: |
+          echo "============================================"
+          echo "⏭️  No deployment needed"
+          echo "============================================"
+          echo ""
+          echo "No changes detected in backend/ or frontend/"
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          echo "To force deployment, use workflow_dispatch with:"
+          echo "  - force_backend: true"
+          echo "  - force_frontend: true"
+          echo "============================================"

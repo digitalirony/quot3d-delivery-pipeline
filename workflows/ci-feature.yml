@@ -1,0 +1,131 @@
+# Sanitized copy of a production workflow from Quot3D (get-quot3d.com).
+# Hostnames, users and private repo names are replaced with GitHub `vars`;
+# the generated .env block is trimmed. Logic is otherwise unchanged.
+# Stored under workflows/ (not .github/workflows/) so it never runs here.
+
+name: CI - Feature Branch
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - testing-deployment
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: backend
+        run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+
+      - name: Run TypeScript type check
+        working-directory: backend
+        run: npx tsc --noEmit
+
+      - name: Run ESLint (if configured)
+        working-directory: backend
+        run: npm run lint || echo "ESLint not configured, skipping..."
+        continue-on-error: true
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quot3d_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: backend
+        run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+
+      - name: Run Prisma migrations
+        working-directory: backend
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+
+      - name: Run unit tests
+        working-directory: backend
+        run: npm run test:unit
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/quot3d_test
+          NODE_ENV: test
+
+  frontend-tests:
+    name: Frontend Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run TypeScript type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm run test:unit

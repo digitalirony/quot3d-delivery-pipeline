@@ -1,0 +1,217 @@
+# Sanitized copy of a production workflow from Quot3D (get-quot3d.com).
+# Hostnames, users and private repo names are replaced with GitHub `vars`;
+# the generated .env block is trimmed. Logic is otherwise unchanged.
+# Stored under workflows/ (not .github/workflows/) so it never runs here.
+
+name: Build & Deploy Slicer Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_cache:
+        description: 'Skip dependency cache (full rebuild)'
+        type: boolean
+        default: false
+
+env:
+  HETZNER_HOST: ${{ vars.DEPLOY_HOST }}
+  HETZNER_USER: ${{ vars.DEPLOY_USER }}
+  ORCA_REPO: ${{ vars.ORCA_REPO }}
+  SLIC3D_REPO: ${{ vars.SLIC3D_REPO }}
+
+jobs:
+  build-and-deploy:
+    name: Build slic3d & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: "quot3d (Production)"
+    steps:
+      - name: Checkout Quot3D (for SSH keys)
+        uses: actions/checkout@v4
+
+      - name: Clone OrcaSlicer source (shallow)
+        run: |
+          echo "Cloning OrcaSlicer source..."
+          git clone --depth 1 https://${{ secrets.SLIC3D_REPO_TOKEN }}@github.com/${{ env.ORCA_REPO }}.git ~/OrcaSlicer-src
+          echo "OrcaSlicer commit: $(cd ~/OrcaSlicer-src && git rev-parse HEAD)"
+
+      - name: Clone slic3d source
+        run: |
+          echo "Cloning slic3d source..."
+          git clone https://${{ secrets.SLIC3D_REPO_TOKEN }}@github.com/${{ env.SLIC3D_REPO }}.git ~/slic3d
+          echo "slic3d commit: $(cd ~/slic3d && git rev-parse HEAD)"
+
+      - name: Install system dependencies
+        run: |
+          echo "Installing system dependencies..."
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libboost-all-dev \
+            nlohmann-json3-dev \
+            libcgal-dev \
+            libtbb-dev \
+            libeigen3-dev \
+            libpng-dev \
+            zlib1g-dev \
+            libexpat1-dev \
+            libssl-dev \
+            libgmp-dev \
+            libmpfr-dev \
+            libcurl4-openssl-dev \
+            libcereal-dev \
+            libnlopt-dev \
+            libnlopt-cxx-dev \
+            libqhull-dev \
+            libglew-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            gettext \
+            libdbus-1-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            m4
+          echo "System dependencies installed"
+
+      - name: Get OrcaSlicer deps cache key
+        id: cache-key
+        run: |
+          ORCA_HASH=$(cd ~/OrcaSlicer-src && git rev-parse HEAD)
+          echo "orca_hash=${ORCA_HASH}" >> $GITHUB_OUTPUT
+
+      - name: Restore OrcaSlicer deps cache
+        if: ${{ github.event.inputs.skip_cache != 'true' }}
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/OrcaSlicer-src/deps/build
+          key: orca-deps-${{ steps.cache-key.outputs.orca_hash }}
+          restore-keys: |
+            orca-deps-
+
+      - name: Build OrcaSlicer dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true' || github.event.inputs.skip_cache == 'true'
+        run: |
+          echo "Building OrcaSlicer dependencies (this may take 20-30 minutes)..."
+          cd ~/OrcaSlicer-src
+          chmod +x build_linux.sh
+          ./build_linux.sh -d
+          echo "OrcaSlicer dependencies built"
+
+      - name: Build libslic3r
+        run: |
+          echo "Building libslic3r..."
+          LIBSLIC3R_BUILD=~/slic3d/build/libslic3r
+          mkdir -p "$LIBSLIC3R_BUILD"
+          cd "$LIBSLIC3R_BUILD"
+
+          DEPS_PREFIX=~/OrcaSlicer-src/deps/build/OrcaSlicer_dep/usr/local
+          cmake ~/OrcaSlicer-src \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$DEPS_PREFIX" \
+            -DOpenVDB_DIR="$DEPS_PREFIX/lib/cmake/OpenVDB" \
+            -DSLIC3R_STATIC=ON \
+            -DSLIC3R_GUI=OFF \
+            -DSLIC3R_FHS=OFF \
+            -DSLIC3R_PCH=OFF \
+            -DSLIC3R_BUILD_TESTS=OFF
+
+          ninja -j$(nproc) libslic3r
+          echo "libslic3r built"
+
+      - name: Build slic3d binary
+        run: |
+          echo "Building slic3d binary..."
+          SLIC3D_BUILD=~/slic3d/build/slic3d
+          mkdir -p "$SLIC3D_BUILD"
+          cd "$SLIC3D_BUILD"
+
+          DEPS_PREFIX=~/OrcaSlicer-src/deps/build/OrcaSlicer_dep/usr/local
+          cmake ~/slic3d \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_LIBSLIC3R=ON \
+            -DLIBSLIC3R_BUILD_DIR=~/slic3d/build/libslic3r \
+            -DORCA_SRC_DIR=~/OrcaSlicer-src \
+            -DDEPS_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_PREFIX_PATH="$DEPS_PREFIX"
+
+          make -j$(nproc)
+          echo "slic3d binary built"
+          ls -lh "$SLIC3D_BUILD/slic3d"
+
+      - name: Verify binary
+        run: |
+          echo "Verifying slic3d binary..."
+          ~/slic3d/build/slic3d/slic3d --help
+          echo "Binary verification passed"
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ env.HETZNER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          echo "SSH key configured"
+
+      - name: Deploy binary to Hetzner
+        run: |
+          echo "Deploying slic3d binary to production..."
+
+          # Copy binary to server
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            ~/slic3d/build/slic3d/slic3d \
+            ${{ env.HETZNER_USER }}@${{ env.HETZNER_HOST }}:/tmp/slic3d-new
+
+          # Install binary and restart PM2
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            ${{ env.HETZNER_USER }}@${{ env.HETZNER_HOST }} << 'EOF'
+            # Replace binary
+            sudo mv /tmp/slic3d-new /usr/local/bin/slic3d
+            sudo chmod +x /usr/local/bin/slic3d
+
+            # Verify on server
+            echo "Verifying binary on server..."
+            /usr/local/bin/slic3d --help | head -5
+
+            # Restart PM2 to pick up new binary
+            if pm2 describe quot3d-api > /dev/null 2>&1; then
+              pm2 reload quot3d-api
+              echo "PM2 reloaded"
+            fi
+          EOF
+
+          echo "Binary deployed successfully"
+
+      - name: Health check
+        run: |
+          echo "Waiting for backend to be ready..."
+          sleep 10
+          for i in {1..12}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ env.HETZNER_HOST }}:3000/health" || echo "000")
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Backend healthy with slicer (HTTP $RESPONSE)"
+              curl -s "http://${{ env.HETZNER_HOST }}:3000/health" | jq .
+              exit 0
+            fi
+            echo "Attempt $i/12: HTTP $RESPONSE, waiting 10s..."
+            sleep 10
+          done
+          echo "Health check failed"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "============================================"
+          echo "Slicer Deployment Complete"
+          echo "============================================"
+          echo ""
+          echo "OrcaSlicer: $(cd ~/OrcaSlicer-src && git rev-parse --short HEAD)"
+          echo "slic3d:     $(cd ~/slic3d && git rev-parse --short HEAD)"
+          echo "Binary:     /usr/local/bin/slic3d"
+          echo "============================================"
